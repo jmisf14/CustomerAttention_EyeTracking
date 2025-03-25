@@ -33,7 +33,7 @@ strip_height, strip_width = image_strip.shape[:2]
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
-    refine_landmarks=True,     # For iris tracking, but we'll do a simpler approach
+    refine_landmarks=True,     # Important for iris tracking
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
@@ -46,27 +46,58 @@ if not cap.isOpened():
 # We'll store how much time each image gets
 attention_time = [0, 0, 0, 0, 0]
 
-print("Starting 20-second eye-tracking session using MediaPipe...")
+print("Starting 20-second eye-tracking session using MediaPipe with IRIS landmarks...")
 print("Press 'q' to quit early.")
 
 start_time = time.time()
 last_frame_time = start_time
 
-# Eye-region landmark indices (approximate) from the 468-point Face Mesh:
-# Left eye (including upper/lower eyelid) typically includes indices around [33, 133, 160-173...].
-# Right eye typically includes indices around [263, 362, 384-397...].
-# Below are smaller subsets representing the central area of each eye:
-LEFT_EYE_INDICES = [33, 133, 160, 159, 158, 153, 145, 144]
-RIGHT_EYE_INDICES = [263, 362, 387, 386, 385, 380, 374, 373]
+# ---- EYE CORNER LANDMARKS (These are approximate; feel free to adjust) ----
+# Left eye corners
+LEFT_EYE_LEFT_CORNER  = 33   # Outer (temporal) corner of left eye
+LEFT_EYE_RIGHT_CORNER = 133  # Inner (nasal) corner of left eye
 
-def get_eye_center_x(landmarks, indices):
-    """Compute the average x-coordinate of selected eye landmarks."""
-    x_sum = 0
-    count = 0
-    for i in indices:
-        x_sum += landmarks[i].x
-        count += 1
-    return x_sum / count if count > 0 else None
+# Right eye corners
+RIGHT_EYE_LEFT_CORNER  = 362  # Outer (temporal) corner of right eye
+RIGHT_EYE_RIGHT_CORNER = 263  # Inner (nasal) corner of right eye
+
+# ---- IRIS LANDMARKS ----
+# Typically for left iris: [468, 469, 470, 471] (and maybe 472)
+LEFT_IRIS_LANDMARKS = [468, 469, 470, 471]
+# For right iris: [473, 474, 475, 476] (and maybe 477)
+RIGHT_IRIS_LANDMARKS = [473, 474, 475, 476]
+
+def average_landmark_x(landmarks, indices):
+    """Returns the average x of the given landmark indices."""
+    xs = [landmarks[i].x for i in indices if i < len(landmarks)]
+    return sum(xs) / len(xs) if len(xs) > 0 else None
+
+def compute_eye_ratio(landmarks, iris_indices, left_corner_idx, right_corner_idx):
+    """
+    Compute how far the iris center is horizontally within the eye.
+    Returns a ratio in [0..1], or None if we cannot compute.
+    """
+    if not landmarks or len(landmarks) < max(iris_indices + [left_corner_idx, right_corner_idx]):
+        return None
+
+    iris_center_x = average_landmark_x(landmarks, iris_indices)
+    if iris_center_x is None:
+        return None
+
+    left_corner_x = landmarks[left_corner_idx].x
+    right_corner_x = landmarks[right_corner_idx].x
+
+    # Make sure left_corner_x < right_corner_x for correct ratio
+    # If it's reversed, swap them
+    if left_corner_x > right_corner_x:
+        left_corner_x, right_corner_x = right_corner_x, left_corner_x
+
+    eye_width = (right_corner_x - left_corner_x)
+    if eye_width == 0:
+        return None
+
+    ratio = (iris_center_x - left_corner_x) / eye_width
+    return ratio
 
 while True:
     ret, frame = cap.read()
@@ -80,7 +111,6 @@ while True:
     # Process face mesh
     results = face_mesh.process(rgb_frame)
 
-    # Default "no gaze" ratio
     horizontal_ratio = None
 
     if results.multi_face_landmarks:
@@ -88,27 +118,30 @@ while True:
         face_landmarks = results.multi_face_landmarks[0]
         landmarks = face_landmarks.landmark
 
-        # Get bounding box for the entire face to normalize
-        xs = [lm.x for lm in landmarks]
-        min_x, max_x = min(xs), max(xs)
+        # Compute left eye ratio
+        left_ratio = compute_eye_ratio(
+            landmarks,
+            LEFT_IRIS_LANDMARKS,
+            LEFT_EYE_LEFT_CORNER,
+            LEFT_EYE_RIGHT_CORNER
+        )
+        # Compute right eye ratio
+        right_ratio = compute_eye_ratio(
+            landmarks,
+            RIGHT_IRIS_LANDMARKS,
+            RIGHT_EYE_LEFT_CORNER,
+            RIGHT_EYE_RIGHT_CORNER
+        )
 
-        # Average left eye center
-        left_eye_center_x = get_eye_center_x(landmarks, LEFT_EYE_INDICES)
-        # Average right eye center
-        right_eye_center_x = get_eye_center_x(landmarks, RIGHT_EYE_INDICES)
-
-        if left_eye_center_x is not None and right_eye_center_x is not None:
-            # We'll take the average of both eyes' center x
-            eyes_avg_x = (left_eye_center_x + right_eye_center_x) / 2.0
-
-            # Normalize: (eyes_avg_x - min_x) / (max_x - min_x)
-            if max_x - min_x > 0:
-                horizontal_ratio = (eyes_avg_x - min_x) / (max_x - min_x)
-                # 0 => far left, 1 => far right
+        if left_ratio is not None and right_ratio is not None:
+            # Average of both eyes
+            horizontal_ratio = (left_ratio + right_ratio) / 2.0
+            # horizontal_ratio in range [0..1]: 0 = looking far left, 1 = looking far right
 
     # Figure out which image is "looked at" based on horizontal_ratio
     looked_index = -1
     if horizontal_ratio is not None:
+        # 5 segments: 0.0–0.2, 0.2–0.4, 0.4–0.6, 0.6–0.8, 0.8–1.0
         if 0.0 <= horizontal_ratio < 0.2:
             looked_index = 0
         elif 0.2 <= horizontal_ratio < 0.4:
@@ -162,7 +195,7 @@ while True:
             2
         )
 
-    cv2.imshow("MediaPipe Eye Tracking Demo (20s)", combined_display)
+    cv2.imshow("MediaPipe Iris Tracking Demo (20s)", combined_display)
 
     # Check if 20 seconds have passed or user presses 'q'
     if (current_time - start_time) >= 20:
@@ -186,4 +219,3 @@ for i, t in enumerate(attention_time, start=1):
 most_looked_index = max(range(len(attention_time)), key=lambda i: attention_time[i])
 print(f"\nMost attention spent on Image #{most_looked_index + 1} "
       f"with ~{attention_time[most_looked_index]:.2f} seconds.")
-
